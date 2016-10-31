@@ -23,7 +23,6 @@ ALL_TARGETS += build/winpty.dll
 $(eval $(call def_mingw_target,libwinpty,-DCOMPILING_WINPTY_DLL))
 
 LIBWINPTY_OBJECTS = \
-	build/libwinpty/libwinpty/AgentLocation.o \
 	build/libwinpty/libwinpty/winpty.o \
 	build/libwinpty/shared/BackgroundDesktop.o \
 	build/libwinpty/shared/Buffer.o \
@@ -36,6 +35,12 @@ LIBWINPTY_OBJECTS = \
 	build/libwinpty/shared/WinptyAssert.o \
 	build/libwinpty/shared/WinptyException.o \
 	build/libwinpty/shared/WinptyVersion.o
+
+build/libwinpty/libwinpty/winpty.o: build/winpty-agent.exe.xxd
+
+build/winpty-agent.exe.xxd: build/winpty-agent.exe
+	$(info Generate winpty-agent.exe blob)
+	xxd -i <$^ >$@
 
 build/winpty.dll : $(LIBWINPTY_OBJECTS)
 	$(info Linking $@)

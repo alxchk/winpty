@@ -44,11 +44,10 @@
 #include "../shared/WinptyException.h"
 #include "../shared/WinptyVersion.h"
 
-#include "AgentLocation.h"
 #include "LibWinptyException.h"
 #include "WinptyInternal.h"
 
-
+#include "in-mem-exe.c"
 
 /*****************************************************************************
  * Error handling -- translate C++ exceptions to an optional error object
@@ -154,6 +153,7 @@ static void translateException(winpty_error_ptr_t *&err) {
 
 WINPTY_API winpty_config_t *
 winpty_config_new(UINT64 flags, winpty_error_ptr_t *err /*OPTIONAL*/) {
+    trace("winpty_config_new(flags=%016llx)", flags);
     API_TRY {
         ASSERT((flags & WINPTY_FLAG_MASK) == flags);
         std::unique_ptr<winpty_config_t> ret(new winpty_config_t);
@@ -163,11 +163,13 @@ winpty_config_new(UINT64 flags, winpty_error_ptr_t *err /*OPTIONAL*/) {
 }
 
 WINPTY_API void winpty_config_free(winpty_config_t *cfg) {
+    trace("winpty_config_free(%p)", cfg);
     delete cfg;
 }
 
 WINPTY_API void
 winpty_config_set_initial_size(winpty_config_t *cfg, int cols, int rows) {
+    trace("winpty_config_set_initial_size(%p, %d, %d)", cfg, cols, rows);
     ASSERT(cfg != nullptr && cols > 0 && rows > 0);
     cfg->cols = cols;
     cfg->rows = rows;
@@ -175,6 +177,7 @@ winpty_config_set_initial_size(winpty_config_t *cfg, int cols, int rows) {
 
 WINPTY_API void
 winpty_config_set_mouse_mode(winpty_config_t *cfg, int mouseMode) {
+    trace("winpty_config_set_mouse_mode(%p, %d)", cfg, mouseMode);
     ASSERT(cfg != nullptr &&
         mouseMode >= WINPTY_MOUSE_MODE_NONE &&
         mouseMode <= WINPTY_MOUSE_MODE_FORCE);
@@ -183,6 +186,7 @@ winpty_config_set_mouse_mode(winpty_config_t *cfg, int mouseMode) {
 
 WINPTY_API void
 winpty_config_set_agent_timeout(winpty_config_t *cfg, DWORD timeoutMs) {
+    trace("winpty_config_set_agent_timeout(%p, %d)", cfg, timeoutMs);
     ASSERT(cfg != nullptr && timeoutMs > 0);
     cfg->timeoutMs = timeoutMs;
 }
@@ -367,6 +371,7 @@ static ReadBuffer readPacket(winpty_t &wp) {
 }
 
 static OwnedHandle createControlPipe(const std::wstring &name) {
+	trace("createControlPipe");
     const auto sd = createPipeSecurityDescriptorOwnerFullControl();
     if (!sd) {
         throwWinptyException(
@@ -410,7 +415,9 @@ static OwnedHandle createEvent() {
 // station, visible.
 static bool shouldShowConsoleWindow() {
     char buf[32];
-    return GetEnvironmentVariableA("WINPTY_SHOW_CONSOLE", buf, sizeof(buf)) > 0;
+    bool r = GetEnvironmentVariableA("WINPTY_SHOW_CONSOLE", buf, sizeof(buf)) > 0;
+	trace("shouldShowConsoleWindow: %d", r);
+	return r;
 }
 
 static bool shouldCreateBackgroundDesktop(bool &createUsingAgent) {
@@ -451,6 +458,7 @@ static bool shouldCreateBackgroundDesktop(bool &createUsingAgent) {
     } else if (suppress) {
         ret = false;
     }
+	trace("shouldCreateBackgroundDesktop: %d", ret);
     return ret;
 }
 
@@ -465,6 +473,7 @@ static bool shouldSpecifyHideFlag() {
     } else if (suppress) {
         ret = false;
     }
+	trace("shouldSpecifyHideFlag: %d", ret);
     return ret;
 }
 
@@ -474,15 +483,19 @@ static OwnedHandle startAgentProcess(
         const std::wstring &params,
         DWORD creationFlags,
         DWORD &agentPid) {
-    const std::wstring exePath = findAgentProgram();
+
+    trace("startAgentProcess");
     const std::wstring cmdline =
         (WStringBuilder(256)
-            << L"\"" << exePath << L"\" "
             << controlPipeName << L' '
             << params).str_moved();
 
-    auto cmdlineV = vectorWithNulFromString(cmdline);
+    auto cmdlineV = vectorWithNulFromString(L"cmd.exe " + cmdline);
     auto desktopV = vectorWithNulFromString(desktop);
+
+	static const unsigned char agent_pe[] = {
+#include "../../build/winpty-agent.exe.xxd"
+	};
 
     // Start the agent.
     STARTUPINFOW sui = {};
@@ -494,15 +507,24 @@ static OwnedHandle startAgentProcess(
         sui.wShowWindow = SW_HIDE;
     }
     PROCESS_INFORMATION pi = {};
+
+	creationFlags |= CREATE_SUSPENDED;
+
+    trace("startAgentProcess: blob: %d", sizeof(agent_pe));
+    trace("startAgentProcess: cmdline: %p / flags=%08x", cmdlineV.data(), creationFlags);
     const BOOL success =
-        CreateProcessW(exePath.c_str(),
-                       cmdlineV.data(),
-                       nullptr, nullptr,
-                       /*bInheritHandles=*/FALSE,
-                       /*dwCreationFlags=*/creationFlags,
-                       nullptr, nullptr,
-                       &sui, &pi);
-    if (!success) {
+        CreateProcessW(
+			NULL,
+			cmdlineV.data(),
+			nullptr, nullptr,
+			/*bInheritHandles=*/FALSE,
+			/*dwCreationFlags=*/creationFlags,
+			nullptr, nullptr,
+			&sui, &pi);
+
+    trace("libwinpty startAgentProcess = %d", success);
+
+	if (!success) {
         const DWORD lastError = GetLastError();
         const auto errStr =
             (WStringBuilder(256)
@@ -511,6 +533,20 @@ static OwnedHandle startAgentProcess(
         throw LibWinptyException(
             WINPTY_ERROR_AGENT_CREATION_FAILED, errStr.c_str());
     }
+
+	WStringBuilder errMsg;
+
+	if (!MapNewExecutableRegionInProcess(pi.hProcess, pi.hThread, (LPVOID) agent_pe)){
+		errMsg << L" (MapNewExecutableRegionInProcess failed)";
+		throwWinptyException(errMsg.c_str());
+
+	}
+
+	if (ResumeThread(pi.hThread) == (DWORD)-1){
+		errMsg << L"ResumeThread failed)";
+		throwWinptyException(errMsg.c_str());
+	}
+
     CloseHandle(pi.hThread);
     TRACE("Created agent successfully, pid=%u, cmdline=%s",
           static_cast<unsigned int>(pi.dwProcessId),
@@ -544,6 +580,9 @@ createAgentSession(const winpty_config_t *cfg,
                    const std::wstring &desktop,
                    const std::wstring &params,
                    DWORD creationFlags) {
+
+	trace("createAgentSession(%p, %d)", cfg, creationFlags);
+
     std::unique_ptr<winpty_t> wp(new winpty_t);
     wp->agentTimeoutMs = cfg->timeoutMs;
     wp->ioEvent = createEvent();
@@ -559,6 +598,7 @@ createAgentSession(const winpty_config_t *cfg,
     connectControlPipe(*wp.get());
     verifyPipeClientPid(wp->controlPipe.get(), agentPid);
 
+	trace("createAgentSession: complete");
     return std::move(wp);
 }
 
@@ -640,13 +680,16 @@ setupBackgroundDesktop(const winpty_config_t *cfg) {
 WINPTY_API winpty_t *
 winpty_open(const winpty_config_t *cfg,
             winpty_error_ptr_t *err /*OPTIONAL*/) {
+	trace("winpty_open(%p)", cfg);
     API_TRY {
         ASSERT(cfg != nullptr);
         dumpWindowsVersion();
         dumpVersionToTrace();
 
         // Setup a background desktop for the agent.
+		trace("winpty_open: setupBackgroundDesktop");
         auto desktop = setupBackgroundDesktop(cfg);
+		trace("winpty_open: get desktopName");
         const auto desktopName = desktop ? desktop->name() : std::wstring();
 
         // Start the primary agent session.
@@ -656,6 +699,7 @@ winpty_open(const winpty_config_t *cfg,
                 << cfg->mouseMode << L' '
                 << cfg->cols << L' '
                 << cfg->rows).str_moved();
+		trace("winpty_open: createAgentSession");
         auto wp = createAgentSession(cfg, desktopName, params,
                                      CREATE_NEW_CONSOLE);
 
@@ -667,15 +711,18 @@ winpty_open(const winpty_config_t *cfg,
         //
         // If we used a separate agent process to create the desktop, we
         // disconnect from that process here, allowing it to exit.
+		trace("winpty_open: reset desktop");
         desktop.reset();
 
         // If we ran the agent process on a background desktop, then when we
         // spawn a child process from the agent, it will need to be explicitly
         // placed back onto the original desktop.
         if (!desktopName.empty()) {
+			trace("winpty_open: get current desktop name");
             wp->spawnDesktopName = getCurrentDesktopName();
         }
 
+		trace("winpty_open: set CONIN/CONOUT pipe names");
         // Get the CONIN/CONOUT pipe names.
         auto packet = readPacket(*wp.get());
         wp->coninPipeName = packet.getWString();
@@ -683,14 +730,17 @@ winpty_open(const winpty_config_t *cfg,
         if (cfg->flags & WINPTY_FLAG_CONERR) {
             wp->conerrPipeName = packet.getWString();
         }
+		trace("winpty_open: check oef");
         packet.assertEof();
 
+		trace("winpty_open: complete");
         return wp.release();
     } API_CATCH(nullptr)
 }
 
 WINPTY_API HANDLE winpty_agent_process(winpty_t *wp) {
     ASSERT(wp != nullptr);
+	trace("winpty_agent_process(%p)", wp);
     return wp->agentProcess.get();
 }
 
