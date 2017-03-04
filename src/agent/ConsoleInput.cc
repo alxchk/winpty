@@ -39,6 +39,7 @@
 #include "UnicodeEncoding.h"
 #include "Win32Console.h"
 
+// MAPVK_VK_TO_VSC isn't defined by the old MinGW.
 #ifndef MAPVK_VK_TO_VSC
 #define MAPVK_VK_TO_VSC 0
 #endif
@@ -191,7 +192,9 @@ static int matchMouseRecord(const char *input, int inputSize, MouseRecord &out)
 
 } // anonymous namespace
 
-ConsoleInput::ConsoleInput(HANDLE conin, int mouseMode, DsrSender &dsrSender) :
+ConsoleInput::ConsoleInput(HANDLE conin, int mouseMode, DsrSender &dsrSender,
+                           Win32Console &console) :
+    m_console(console),
     m_conin(conin),
     m_mouseMode(mouseMode),
     m_dsrSender(dsrSender)
@@ -288,10 +291,10 @@ void ConsoleInput::flushIncompleteEscapeCode()
 void ConsoleInput::updateInputFlags(bool forceTrace)
 {
     const DWORD mode = inputConsoleMode();
-    const bool newFlagEE = mode & ENABLE_EXTENDED_FLAGS;
-    const bool newFlagMI = mode & ENABLE_MOUSE_INPUT;
-    const bool newFlagQE = mode & ENABLE_QUICK_EDIT_MODE;
-    const bool newFlagEI = mode & 0x200;
+    const bool newFlagEE = (mode & ENABLE_EXTENDED_FLAGS) != 0;
+    const bool newFlagMI = (mode & ENABLE_MOUSE_INPUT) != 0;
+    const bool newFlagQE = (mode & ENABLE_QUICK_EDIT_MODE) != 0;
+    const bool newFlagEI = (mode & 0x200) != 0;
     if (forceTrace ||
             newFlagEE != m_enableExtendedEnabled ||
             newFlagMI != m_mouseInputEnabled ||
@@ -591,16 +594,41 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
                                   uint32_t codePoint,
                                   uint16_t keyState)
 {
-    const bool ctrl = keyState & LEFT_CTRL_PRESSED;
-    const bool alt = keyState & LEFT_ALT_PRESSED;
-    const bool shift = keyState & SHIFT_PRESSED;
+    const bool ctrl = (keyState & LEFT_CTRL_PRESSED) != 0;
+    const bool alt = (keyState & LEFT_ALT_PRESSED) != 0;
+    const bool shift = (keyState & SHIFT_PRESSED) != 0;
+    const bool enhanced = (keyState & ENHANCED_KEY) != 0;
+    bool hasDebugInput = false;
 
     if (isTracingEnabled()) {
         static bool debugInput = hasDebugFlag("input");
         if (debugInput) {
+            hasDebugInput = true;
             InputMap::Key key = { virtualKey, codePoint, keyState };
             trace("keypress: %s", key.toString().c_str());
         }
+    }
+
+    if (m_escapeInputEnabled &&
+            (virtualKey == VK_UP ||
+                virtualKey == VK_DOWN ||
+                virtualKey == VK_LEFT ||
+                virtualKey == VK_RIGHT ||
+                virtualKey == VK_HOME ||
+                virtualKey == VK_END) &&
+            !ctrl && !alt && !shift) {
+        if (hasDebugInput) {
+            trace("sending keypress to console HWND");
+        }
+        uint32_t scanCode = MapVirtualKey(virtualKey, MAPVK_VK_TO_VSC);
+        if (scanCode > 255) {
+            scanCode = 0;
+        }
+        SendMessage(m_console.hwnd(), WM_KEYDOWN, virtualKey,
+            (scanCode << 16) | 1u);
+        SendMessage(m_console.hwnd(), WM_KEYUP, virtualKey,
+            (scanCode << 16) | (1u | (1u << 30) | (1u << 31)));
+        return;
     }
 
     uint16_t stepKeyState = 0;
@@ -615,6 +643,9 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
     if (shift) {
         stepKeyState |= SHIFT_PRESSED;
         appendInputRecord(records, TRUE, VK_SHIFT, 0, stepKeyState);
+    }
+    if (enhanced) {
+        stepKeyState |= ENHANCED_KEY;
     }
     if (m_escapeInputEnabled) {
         reencodeEscapedKeyPress(records, virtualKey, codePoint, stepKeyState);
@@ -632,6 +663,9 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
         codePoint = 0;
     }
     appendCPInputRecords(records, FALSE, virtualKey, codePoint, stepKeyState);
+    if (enhanced) {
+        stepKeyState &= ~ENHANCED_KEY;
+    }
     if (shift) {
         stepKeyState &= ~SHIFT_PRESSED;
         appendInputRecord(records, FALSE, VK_SHIFT, 0, stepKeyState);

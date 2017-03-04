@@ -42,6 +42,8 @@ build/winpty-agent.exe.xxd: build/winpty-agent.exe
 	$(info Generate winpty-agent.exe blob)
 	xxd -i <$^ >$@
 
+build/libwinpty/shared/WinptyVersion.o : build/gen/GenVersion.h
+
 build/winpty.dll : $(LIBWINPTY_OBJECTS)
 	$(info Linking $@)
 	@$(MINGW_CXX) $(MINGW_LDFLAGS) -shared -o $@ $^ -Wl,--out-implib,build/winpty.lib
