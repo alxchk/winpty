@@ -343,12 +343,38 @@ void ConsoleInput::doWrite(bool isEof)
         idx += charSize;
     }
     m_byteQueue.erase(0, idx);
-    DWORD actual = 0;
-    if (records.size() > 0) {
-        if (!WriteConsoleInputW(m_conin, records.data(), records.size(), &actual)) {
-            trace("WriteConsoleInputW failed");
-        }
+    flushInputRecords(records);
+}
+
+void ConsoleInput::flushInputRecords(std::vector<INPUT_RECORD> &records)
+{
+    if (records.size() == 0) {
+        return;
     }
+    DWORD actual = 0;
+    if (!WriteConsoleInputW(m_conin, records.data(), records.size(), &actual)) {
+        trace("WriteConsoleInputW failed");
+    }
+    records.clear();
+}
+
+// This behavior isn't strictly correct, because the keypresses (probably?)
+// adopt the keyboard state (e.g. Ctrl/Alt/Shift modifiers) of the current
+// window station's keyboard, which has no necessary relationship to the winpty
+// instance.  It's unlikely to be an issue in practice, but it's conceivable.
+// (Imagine a foreground SSH server, where the local user holds down Ctrl,
+// while the remote user tries to use WSL navigation keys.)  I suspect using
+// the BackgroundDesktop mechanism in winpty would fix the problem.
+//
+// https://github.com/rprichard/winpty/issues/116
+static void sendKeyMessage(HWND hwnd, bool isKeyDown, uint16_t virtualKey)
+{
+    uint32_t scanCode = MapVirtualKey(virtualKey, MAPVK_VK_TO_VSC);
+    if (scanCode > 255) {
+        scanCode = 0;
+    }
+    SendMessage(hwnd, isKeyDown ? WM_KEYDOWN : WM_KEYUP, virtualKey,
+        (scanCode << 16) | 1u | (isKeyDown ? 0u : 0xc0000000u));
 }
 
 int ConsoleInput::scanInput(std::vector<INPUT_RECORD> &records,
@@ -359,9 +385,20 @@ int ConsoleInput::scanInput(std::vector<INPUT_RECORD> &records,
     ASSERT(inputSize >= 1);
 
     // Ctrl-C.
+    //
+    // In processed mode, use GenerateConsoleCtrlEvent so that Ctrl-C handlers
+    // are called.  GenerateConsoleCtrlEvent unfortunately doesn't interrupt
+    // ReadConsole calls[1].  Using WM_KEYDOWN/UP fixes the ReadConsole
+    // problem, but breaks in background window stations/desktops.
+    //
+    // In unprocessed mode, there's an entry for Ctrl-C in the SimpleEncoding
+    // table in DefaultInputMap.
+    //
+    // [1] https://github.com/rprichard/winpty/issues/116
     if (input[0] == '\x03' && (inputConsoleMode() & ENABLE_PROCESSED_INPUT)) {
+        flushInputRecords(records);
         trace("Ctrl-C");
-        BOOL ret = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+        const BOOL ret = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
         trace("GenerateConsoleCtrlEvent: %d", ret);
         return 1;
     }
@@ -395,10 +432,17 @@ int ConsoleInput::scanInput(std::vector<INPUT_RECORD> &records,
         trace("Incomplete escape sequence");
         return -1;
     } else if (matchLen > 0) {
-        appendKeyPress(records,
-                       match.virtualKey,
-                       match.unicodeChar,
-                       match.keyState);
+        uint32_t winCodePointDn = match.unicodeChar;
+        if ((match.keyState & LEFT_CTRL_PRESSED) && (match.keyState & LEFT_ALT_PRESSED)) {
+            winCodePointDn = '\0';
+        }
+        uint32_t winCodePointUp = winCodePointDn;
+        if (match.keyState & LEFT_ALT_PRESSED) {
+            winCodePointUp = '\0';
+        }
+        appendKeyPress(records, match.virtualKey,
+                       winCodePointDn, winCodePointUp, match.keyState,
+                       match.unicodeChar, match.keyState);
         return matchLen;
     }
 
@@ -417,7 +461,7 @@ int ConsoleInput::scanInput(std::vector<INPUT_RECORD> &records,
                 trace("Incomplete UTF-8 character in Alt-<Char>");
                 return -1;
             }
-            appendUtf8Char(records, &input[1], len, LEFT_ALT_PRESSED);
+            appendUtf8Char(records, &input[1], len, true);
             return 1 + len;
         }
     }
@@ -437,7 +481,7 @@ int ConsoleInput::scanInput(std::vector<INPUT_RECORD> &records,
         trace("Incomplete UTF-8 character");
         return -1;
     }
-    appendUtf8Char(records, &input[0], len, 0);
+    appendUtf8Char(records, &input[0], len, false);
     return len;
 }
 
@@ -557,10 +601,10 @@ int ConsoleInput::scanMouseInput(std::vector<INPUT_RECORD> &records,
 void ConsoleInput::appendUtf8Char(std::vector<INPUT_RECORD> &records,
                                   const char *charBuffer,
                                   const int charLen,
-                                  const uint16_t keyState)
+                                  const bool terminalAltEscape)
 {
-    const uint32_t code = decodeUtf8(charBuffer);
-    if (code == static_cast<uint32_t>(-1)) {
+    const uint32_t codePoint = decodeUtf8(charBuffer);
+    if (codePoint == static_cast<uint32_t>(-1)) {
         static bool debugInput = isTracingEnabled() && hasDebugFlag("input");
         if (debugInput) {
             StringBuilder error(64);
@@ -574,37 +618,65 @@ void ConsoleInput::appendUtf8Char(std::vector<INPUT_RECORD> &records,
         return;
     }
 
-    const short charScan = code > 0xFFFF ? -1 : VkKeyScan(code);
+    const short charScan = codePoint > 0xFFFF ? -1 : VkKeyScan(codePoint);
     uint16_t virtualKey = 0;
-    uint16_t charKeyState = keyState;
+    uint16_t winKeyState = 0;
+    uint32_t winCodePointDn = codePoint;
+    uint32_t winCodePointUp = codePoint;
+    uint16_t vtKeyState = 0;
+
     if (charScan != -1) {
         virtualKey = charScan & 0xFF;
-        if (charScan & 0x100)
-            charKeyState |= SHIFT_PRESSED;
-        else if (charScan & 0x200)
-            charKeyState |= LEFT_CTRL_PRESSED;
-        else if (charScan & 0x400)
-            charKeyState |= LEFT_ALT_PRESSED;
+        if (charScan & 0x100) {
+            winKeyState |= SHIFT_PRESSED;
+        }
+        if (charScan & 0x200) {
+            winKeyState |= LEFT_CTRL_PRESSED;
+        }
+        if (charScan & 0x400) {
+            winKeyState |= RIGHT_ALT_PRESSED;
+        }
+        if (terminalAltEscape && (winKeyState & LEFT_CTRL_PRESSED)) {
+            // If the terminal escapes a Ctrl-<Key> with Alt, then set the
+            // codepoint to 0.  On the other hand, if a character requires
+            // AltGr (like U+00B2 on a German layout), then VkKeyScan will
+            // report both Ctrl and Alt pressed, and we should keep the
+            // codepoint.  See https://github.com/rprichard/winpty/issues/109.
+            winCodePointDn = 0;
+            winCodePointUp = 0;
+        }
     }
-    appendKeyPress(records, virtualKey, code, charKeyState);
+    if (terminalAltEscape) {
+        winCodePointUp = 0;
+        winKeyState |= LEFT_ALT_PRESSED;
+        vtKeyState |= LEFT_ALT_PRESSED;
+    }
+
+    appendKeyPress(records, virtualKey,
+                   winCodePointDn, winCodePointUp, winKeyState,
+                   codePoint, vtKeyState);
 }
 
 void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
-                                  uint16_t virtualKey,
-                                  uint32_t codePoint,
-                                  uint16_t keyState)
+                                  const uint16_t virtualKey,
+                                  const uint32_t winCodePointDn,
+                                  const uint32_t winCodePointUp,
+                                  const uint16_t winKeyState,
+                                  const uint32_t vtCodePoint,
+                                  const uint16_t vtKeyState)
 {
-    const bool ctrl = (keyState & LEFT_CTRL_PRESSED) != 0;
-    const bool alt = (keyState & LEFT_ALT_PRESSED) != 0;
-    const bool shift = (keyState & SHIFT_PRESSED) != 0;
-    const bool enhanced = (keyState & ENHANCED_KEY) != 0;
+    const bool ctrl = (winKeyState & LEFT_CTRL_PRESSED) != 0;
+    const bool leftAlt = (winKeyState & LEFT_ALT_PRESSED) != 0;
+    const bool rightAlt = (winKeyState & RIGHT_ALT_PRESSED) != 0;
+    const bool shift = (winKeyState & SHIFT_PRESSED) != 0;
+    const bool enhanced = (winKeyState & ENHANCED_KEY) != 0;
     bool hasDebugInput = false;
 
     if (isTracingEnabled()) {
         static bool debugInput = hasDebugFlag("input");
         if (debugInput) {
             hasDebugInput = true;
-            InputMap::Key key = { virtualKey, codePoint, keyState };
+            InputMap::Key key = { virtualKey, winCodePointDn, winKeyState };
             trace("keypress: %s", key.toString().c_str());
         }
     }
@@ -616,18 +688,13 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
                 virtualKey == VK_RIGHT ||
                 virtualKey == VK_HOME ||
                 virtualKey == VK_END) &&
-            !ctrl && !alt && !shift) {
+            !ctrl && !leftAlt && !rightAlt && !shift) {
+        flushInputRecords(records);
         if (hasDebugInput) {
             trace("sending keypress to console HWND");
         }
-        uint32_t scanCode = MapVirtualKey(virtualKey, MAPVK_VK_TO_VSC);
-        if (scanCode > 255) {
-            scanCode = 0;
-        }
-        SendMessage(m_console.hwnd(), WM_KEYDOWN, virtualKey,
-            (scanCode << 16) | 1u);
-        SendMessage(m_console.hwnd(), WM_KEYUP, virtualKey,
-            (scanCode << 16) | (1u | (1u << 30) | (1u << 31)));
+        sendKeyMessage(m_console.hwnd(), true, virtualKey);
+        sendKeyMessage(m_console.hwnd(), false, virtualKey);
         return;
     }
 
@@ -636,9 +703,13 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
         stepKeyState |= LEFT_CTRL_PRESSED;
         appendInputRecord(records, TRUE, VK_CONTROL, 0, stepKeyState);
     }
-    if (alt) {
+    if (leftAlt) {
         stepKeyState |= LEFT_ALT_PRESSED;
         appendInputRecord(records, TRUE, VK_MENU, 0, stepKeyState);
+    }
+    if (rightAlt) {
+        stepKeyState |= RIGHT_ALT_PRESSED;
+        appendInputRecord(records, TRUE, VK_MENU, 0, stepKeyState | ENHANCED_KEY);
     }
     if (shift) {
         stepKeyState |= SHIFT_PRESSED;
@@ -648,21 +719,11 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
         stepKeyState |= ENHANCED_KEY;
     }
     if (m_escapeInputEnabled) {
-        reencodeEscapedKeyPress(records, virtualKey, codePoint, stepKeyState);
+        reencodeEscapedKeyPress(records, virtualKey, vtCodePoint, vtKeyState);
     } else {
-        if (ctrl && alt) {
-            // This behavior seems arbitrary, but it's what I see in the
-            // Windows 7 console.
-            codePoint = 0;
-        }
-        appendCPInputRecords(records, TRUE, virtualKey, codePoint, stepKeyState);
+        appendCPInputRecords(records, TRUE, virtualKey, winCodePointDn, stepKeyState);
     }
-    if (alt) {
-        // This behavior seems arbitrary, but it's what I see in the Windows 7
-        // console.
-        codePoint = 0;
-    }
-    appendCPInputRecords(records, FALSE, virtualKey, codePoint, stepKeyState);
+    appendCPInputRecords(records, FALSE, virtualKey, winCodePointUp, stepKeyState);
     if (enhanced) {
         stepKeyState &= ~ENHANCED_KEY;
     }
@@ -670,7 +731,11 @@ void ConsoleInput::appendKeyPress(std::vector<INPUT_RECORD> &records,
         stepKeyState &= ~SHIFT_PRESSED;
         appendInputRecord(records, FALSE, VK_SHIFT, 0, stepKeyState);
     }
-    if (alt) {
+    if (rightAlt) {
+        stepKeyState &= ~RIGHT_ALT_PRESSED;
+        appendInputRecord(records, FALSE, VK_MENU, 0, stepKeyState | ENHANCED_KEY);
+    }
+    if (leftAlt) {
         stepKeyState &= ~LEFT_ALT_PRESSED;
         appendInputRecord(records, FALSE, VK_MENU, 0, stepKeyState);
     }

@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -332,6 +333,9 @@ void Agent::handlePacket(ReadBuffer &packet)
         // at once, we can ignore the early ones.
         handleSetSizePacket(packet);
         break;
+    case AgentMsg::GetConsoleProcessList:
+        handleGetConsoleProcessListPacket(packet);
+        break;
     default:
         trace("Unrecognized message, id:%d", type);
     }
@@ -423,6 +427,33 @@ void Agent::handleSetSizePacket(ReadBuffer &packet)
     packet.assertEof();
     resizeWindow(cols, rows);
     auto reply = newPacket();
+    writePacket(reply);
+}
+
+void Agent::handleGetConsoleProcessListPacket(ReadBuffer &packet)
+{
+    packet.assertEof();
+
+    auto processList = std::vector<DWORD>(64);
+    auto processCount = GetConsoleProcessList(&processList[0], processList.size());
+
+    // The process list can change while we're trying to read it
+    while (processList.size() < processCount) {
+        // Multiplying by two caps the number of iterations
+        const auto newSize = std::max<DWORD>(processList.size() * 2, processCount);
+        processList.resize(newSize);
+        processCount = GetConsoleProcessList(&processList[0], processList.size());
+    }
+
+    if (processCount == 0) {
+        trace("GetConsoleProcessList failed");
+    }
+
+    auto reply = newPacket();
+    reply.putInt32(processCount);
+    for (DWORD i = 0; i < processCount; i++) {
+        reply.putInt32(processList[i]);
+    }
     writePacket(reply);
 }
 
@@ -529,11 +560,31 @@ void Agent::resizeWindow(int cols, int rows)
     Win32Console::FreezeGuard guard(m_console, m_console.frozen());
     const Coord newSize(cols, rows);
     ConsoleScreenBufferInfo info;
-    m_primaryScraper->resizeWindow(*openPrimaryBuffer(), newSize, info);
+    auto primaryBuffer = openPrimaryBuffer();
+    m_primaryScraper->resizeWindow(*primaryBuffer, newSize, info);
     m_consoleInput->setMouseWindowRect(info.windowRect());
     if (m_errorScraper) {
         m_errorScraper->resizeWindow(*m_errorBuffer, newSize, info);
     }
+
+    // Synthesize a WINDOW_BUFFER_SIZE_EVENT event.  Normally, Windows
+    // generates this event only when the buffer size changes, not when the
+    // window size changes.  This behavior is undesirable in two ways:
+    //  - When winpty expands the window horizontally, it must expand the
+    //    buffer first, then the window.  At least some programs (e.g. the WSL
+    //    bash.exe wrapper) use the window width rather than the buffer width,
+    //    so there is a short timespan during which they can read the wrong
+    //    value.
+    //  - If the window's vertical size is changed, no event is generated,
+    //    even though a typical well-behaved console program cares about the
+    //    *window* height, not the *buffer* height.
+    // This synthesization works around a design flaw in the console.  It's probably
+    // harmless.  See https://github.com/rprichard/winpty/issues/110.
+    INPUT_RECORD sizeEvent {};
+    sizeEvent.EventType = WINDOW_BUFFER_SIZE_EVENT;
+    sizeEvent.Event.WindowBufferSizeEvent.dwSize = primaryBuffer->bufferSize();
+    DWORD actual {};
+    WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &sizeEvent, 1, &actual);
 }
 
 void Agent::scrapeBuffers()

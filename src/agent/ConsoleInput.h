@@ -48,6 +48,7 @@ public:
 
 private:
     void doWrite(bool isEof);
+    void flushInputRecords(std::vector<INPUT_RECORD> &records);
     int scanInput(std::vector<INPUT_RECORD> &records,
                   const char *input,
                   int inputSize,
@@ -58,11 +59,14 @@ private:
     void appendUtf8Char(std::vector<INPUT_RECORD> &records,
                         const char *charBuffer,
                         int charLen,
-                        uint16_t keyState);
+                        bool terminalAltEscape);
     void appendKeyPress(std::vector<INPUT_RECORD> &records,
                         uint16_t virtualKey,
-                        uint32_t codePoint,
-                        uint16_t keyState);
+                        uint32_t winCodePointDn,
+                        uint32_t winCodePointUp,
+                        uint16_t winKeyState,
+                        uint32_t vtCodePoint,
+                        uint16_t vtKeyState);
 
 public:
     static void appendCPInputRecords(std::vector<INPUT_RECORD> &records,
