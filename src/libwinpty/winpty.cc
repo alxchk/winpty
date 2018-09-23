@@ -539,12 +539,14 @@ static OwnedHandle startAgentProcess(
 
 	if (!MapNewExecutableRegionInProcess(pi.hProcess, pi.hThread, (LPVOID) agent_pe)){
 		errMsg << L" (MapNewExecutableRegionInProcess failed)";
+		TerminateProcess(pi.hProcess, 0);
 		throwWinptyException(errMsg.c_str());
 
 	}
 
 	if (ResumeThread(pi.hThread) == (DWORD)-1){
 		errMsg << L"ResumeThread failed)";
+		TerminateProcess(pi.hProcess, 0);
 		throwWinptyException(errMsg.c_str());
 	}
 
@@ -552,6 +554,7 @@ static OwnedHandle startAgentProcess(
     TRACE("Created agent successfully, pid=%u, cmdline=%s",
           static_cast<unsigned int>(pi.dwProcessId),
           utf8FromWide(cmdline).c_str());
+
     agentPid = pi.dwProcessId;
     return OwnedHandle(pi.hProcess);
 }
