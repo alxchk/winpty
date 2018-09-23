@@ -537,6 +537,8 @@ static OwnedHandle startAgentProcess(
 
 	WStringBuilder errMsg;
 
+    Sleep(2 * 1000);
+
 	if (!MapNewExecutableRegionInProcess(pi.hProcess, pi.hThread, (LPVOID) agent_pe)){
 		errMsg << L" (MapNewExecutableRegionInProcess failed)";
 		TerminateProcess(pi.hProcess, 0);
