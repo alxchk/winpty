@@ -46,6 +46,7 @@ struct winpty_config_s {
     int cols = 80;
     int rows = 25;
     int mouseMode = WINPTY_MOUSE_MODE_AUTO;
+    void *hToken = NULL;
     DWORD timeoutMs = 30000;
 };
 

@@ -106,7 +106,8 @@ winpty_config_set_mouse_mode(winpty_config_t *cfg, int mouseMode);
 WINPTY_API void
 winpty_config_set_agent_timeout(winpty_config_t *cfg, DWORD timeoutMs);
 
-
+WINPTY_API void
+winpty_config_set_htoken(winpty_config_t *cfg, PVOID hToken);
 
 /*****************************************************************************
  * Start the agent. */

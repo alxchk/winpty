@@ -176,6 +176,12 @@ winpty_config_set_initial_size(winpty_config_t *cfg, int cols, int rows) {
 }
 
 WINPTY_API void
+winpty_config_set_htoken(winpty_config_t *cfg, void *hToken) {
+    trace("nwinpty_config_set_htoken(%p, %p)", cfg, hToken);
+    cfg->hToken = hToken;
+}
+
+WINPTY_API void
 winpty_config_set_mouse_mode(winpty_config_t *cfg, int mouseMode) {
     trace("winpty_config_set_mouse_mode(%p, %d)", cfg, mouseMode);
     ASSERT(cfg != nullptr &&
@@ -371,9 +377,13 @@ static ReadBuffer readPacket(winpty_t &wp) {
     return ReadBuffer(std::move(bytes));
 }
 
-static OwnedHandle createControlPipe(const std::wstring &name) {
-	trace("createControlPipe");
-    const auto sd = createPipeSecurityDescriptorOwnerFullControl();
+static OwnedHandle createControlPipe(const std::wstring &name, bool impersonated) {
+	trace("createControlPipe, impersonated? %d", impersonated);
+    const auto sd = impersonated? \
+		createPipeSecurityDescriptorOwnerFullControlEveryoneWrite() : \
+		createPipeSecurityDescriptorOwnerFullControl();
+
+	trace("SD: %d, %d", !sd, GetLastError());
     if (!sd) {
         throwWinptyException(
             L"could not create the control pipe's SECURITY_DESCRIPTOR");
@@ -381,6 +391,7 @@ static OwnedHandle createControlPipe(const std::wstring &name) {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = sd.get();
+
     HANDLE ret = CreateNamedPipeW(name.c_str(),
         /*dwOpenMode=*/
         PIPE_ACCESS_DUPLEX |
@@ -397,8 +408,6 @@ static OwnedHandle createControlPipe(const std::wstring &name) {
     }
     return OwnedHandle(ret);
 }
-
-
 
 /*****************************************************************************
  * Start the agent. */
@@ -482,6 +491,7 @@ static OwnedHandle startAgentProcess(
         const std::wstring &desktop,
         const std::wstring &controlPipeName,
         const std::wstring &params,
+        void *hToken,
         DWORD creationFlags,
         DWORD &agentPid) {
 
@@ -513,8 +523,20 @@ static OwnedHandle startAgentProcess(
 
     trace("startAgentProcess: blob: %d", sizeof(agent_pe));
     trace("startAgentProcess: cmdline: %p / flags=%08x", cmdlineV.data(), creationFlags);
-    const BOOL success =
-        CreateProcessW(
+    BOOL success;
+
+    if (hToken)
+        success = CreateProcessAsUserW(
+            hToken,
+			NULL,
+			cmdlineV.data(),
+			nullptr, nullptr,
+			/*bInheritHandles=*/FALSE,
+			/*dwCreationFlags=*/creationFlags,
+			nullptr, nullptr,
+			&sui, &pi);
+    else
+        success = CreateProcessW(
 			NULL,
 			cmdlineV.data(),
 			nullptr, nullptr,
@@ -527,6 +549,8 @@ static OwnedHandle startAgentProcess(
 
 	if (!success) {
         const DWORD lastError = GetLastError();
+        trace("CreateProcess failed: %d", lastError);
+
         const auto errStr =
             (WStringBuilder(256)
                 << L"winpty-agent CreateProcess failed: cmdline='" << cmdline
@@ -594,13 +618,19 @@ createAgentSession(const winpty_config_t *cfg,
     wp->ioEvent = createEvent();
 
     // Create control server pipe.
+    trace("createControlPipe start");
+
     const auto pipeName =
         L"\\\\.\\pipe\\winpty-control-" + GenRandom().uniqueName();
-    wp->controlPipe = createControlPipe(pipeName);
+    wp->controlPipe = createControlPipe(pipeName, bool(cfg->hToken));
+    trace("createControlPipe complete");
+
 
     DWORD agentPid = 0;
     wp->agentProcess = startAgentProcess(
-        desktop, pipeName, params, creationFlags, agentPid);
+        desktop, pipeName, params,
+        cfg->hToken,
+        creationFlags, agentPid);
     connectControlPipe(*wp.get());
     verifyPipeClientPid(wp->controlPipe.get(), agentPid);
 
