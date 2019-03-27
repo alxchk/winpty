@@ -92,8 +92,19 @@ BOOL MapNewExecutableRegionInProcess(
 	SIZE_T                    dwBytesWritten;
 	SIZE_T                    dwBytesRead;
 	int                       Count;
-	PCONTEXT                  ThreadContext;
+	CONTEXT                   ThreadContext = {};
 	BOOL                      Success = FALSE;
+    BYTE                      iBrk = 0xCC;
+    BYTE                      iOriginal = 0x0;
+
+	HMODULE                   hNtlDll = NULL;
+	PBYTE                     pRtlUserThreadStart = NULL;
+	PBYTE                     pLdrSystemDllInitBlock = NULL;
+	PULONGLONG                pulFlag = NULL;
+
+	ULONGLONG                 ulFlags = 0;
+	LONGLONG                  ulDiff = 0;
+	LONGLONG                  ulOriginalFlags = 0;
 
 	DosHeader = (PIMAGE_DOS_HEADER)NewExecutableRawImage;
 	if (DosHeader->e_magic == IMAGE_DOS_SIGNATURE)
@@ -102,16 +113,10 @@ BOOL MapNewExecutableRegionInProcess(
 		if (NtHeader64->Signature == IMAGE_NT_SIGNATURE)
 		{
 			RtlZeroMemory(&BasicInformation, sizeof(PROCESS_INFORMATION));
-			ThreadContext = (PCONTEXT)VirtualAlloc(NULL, sizeof(ThreadContext) + 4, MEM_COMMIT, PAGE_READWRITE);
-			ThreadContext = (PCONTEXT)Align((uintptr_t)ThreadContext, 4);
-			ThreadContext->ContextFlags = CONTEXT_FULL;
-			if (GetThreadContext(TargetThreadHandle, ThreadContext)) //used to be LPCONTEXT(ThreadContext)
+			ThreadContext.ContextFlags = CONTEXT_FULL;
+			if (GetThreadContext(TargetThreadHandle, &ThreadContext))
 			{
-				ReadProcessMemory(TargetProcessHandle, (LPCVOID)(ThreadContext->Rdx + 16), &dwImageBase, sizeof(DWORD_PTR), &dwBytesRead);
-
-				pNtUnmapViewOfSection = (NtUnmapViewOfSection)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtUnmapViewOfSection");
-				if (pNtUnmapViewOfSection)
-					pNtUnmapViewOfSection(TargetProcessHandle, (PVOID)dwImageBase);
+				ReadProcessMemory(TargetProcessHandle, (LPCVOID)(ThreadContext.Rdx + 16), &dwImageBase, sizeof(DWORD_PTR), &dwBytesRead);
 
 				pImageBase = VirtualAllocEx(TargetProcessHandle, (LPVOID)NtHeader64->OptionalHeader.ImageBase, NtHeader64->OptionalHeader.SizeOfImage, 0x3000, PAGE_EXECUTE_READWRITE);
 				if (pImageBase)
@@ -123,9 +128,135 @@ BOOL MapNewExecutableRegionInProcess(
 						WriteProcessMemory(TargetProcessHandle, (LPVOID)((DWORD_PTR)pImageBase + SectionHeader->VirtualAddress), (LPVOID)((DWORD_PTR)NewExecutableRawImage + SectionHeader->PointerToRawData), SectionHeader->SizeOfRawData, &dwBytesWritten);
 						SectionHeader++;
 					}
-					WriteProcessMemory(TargetProcessHandle, (LPVOID)(ThreadContext->Rdx + 16), (LPVOID)&NtHeader64->OptionalHeader.ImageBase, sizeof(DWORD_PTR), &dwBytesWritten);
-					ThreadContext->Rcx = (DWORD_PTR)pImageBase + NtHeader64->OptionalHeader.AddressOfEntryPoint;
-					SetThreadContext(TargetThreadHandle, (LPCONTEXT)ThreadContext);
+					WriteProcessMemory(TargetProcessHandle, (LPVOID)(ThreadContext.Rdx + 16), (LPVOID)&NtHeader64->OptionalHeader.ImageBase, sizeof(DWORD_PTR), &dwBytesWritten);
+					ThreadContext.Rcx = (DWORD_PTR)pImageBase + NtHeader64->OptionalHeader.AddressOfEntryPoint;
+					SetThreadContext(TargetThreadHandle, &ThreadContext);
+
+					// CFG Workaround?
+					// Check own flag
+					//
+					// Find offset for ntdll!RtlUserThreadStart == RIP
+					// Find offset for ntdll!LdrSystemDllInitBlock
+					// Find diff in current process
+					// Expect that diff is same in parent process
+					// current ntdll (ntdll!LdrSystemDllInitBlock+0xa8)
+					// Check value in remote process
+					// If 2000100000000010 - replace to 2000000000000000
+
+					trace("FIX LdrSystemDllInitBlock");
+
+					hNtlDll = GetModuleHandleA("NTDLL.DLL");
+					if (hNtlDll) {
+						pRtlUserThreadStart = (PBYTE) GetProcAddress(
+							hNtlDll, "RtlUserThreadStart");
+
+						pLdrSystemDllInitBlock = (PBYTE) GetProcAddress(
+							hNtlDll, "LdrSystemDllInitBlock");
+
+						if (pLdrSystemDllInitBlock && pRtlUserThreadStart) {
+							pulFlag = (PULONGLONG) (pLdrSystemDllInitBlock + 0xa8);
+
+							if (*pulFlag == 0x2000100000000010L) {
+								ulDiff = ((LONGLONG) pLdrSystemDllInitBlock) - \
+									((LONGLONG) pRtlUserThreadStart);
+							} else {
+								trace("Unexpected flag: %p at %p",
+									*pulFlag, pulFlag);
+							}
+
+						} else {
+							trace("Symbols not found: %p, %p\n",
+								pLdrSystemDllInitBlock, pRtlUserThreadStart);
+						}
+
+					} else {
+						trace("NTDLL not found: %d", GetLastError());
+					}
+
+
+					trace("DIFF: %dll", ulDiff);
+
+					if (ulDiff) {
+
+						if (!ReadProcessMemory(
+								TargetProcessHandle,
+								(PVOID)(ThreadContext.Rip + ulDiff + 0xa8),
+								&ulOriginalFlags,
+								sizeof(ulOriginalFlags),
+								&dwBytesRead))
+						{
+							trace("Couldn't read original flags: %d",
+								GetLastError());
+						}
+
+
+						trace("Original flags: %p at %p\n",
+							ulOriginalFlags, (PVOID)(
+								ThreadContext.Rip + ulDiff + 0xa8));
+
+						if (ulOriginalFlags == 0x2000100000000010L) {
+							ulOriginalFlags = 0x2000000000000000L;
+
+							WriteProcessMemory(
+								TargetProcessHandle,
+								(PVOID) (ThreadContext.Rip + ulDiff + 0xa8),
+								&ulOriginalFlags,
+								sizeof(ulOriginalFlags),
+								&dwBytesRead);
+						} else {
+							trace("Unexpected remote original flag: %p\n",
+								 ulOriginalFlags);
+						}
+					}
+
+#if 0
+                    // DEBUG
+                    // Loader entry point, Windows 10
+
+                    /* if (!VirtualProtectEx( */
+					/* 	TargetProcessHandle, */
+					/* 	(PVOID)(ThreadContext.Rip + 0x6CD54), */
+					/* 	4, */
+					/* 	PAGE_EXECUTE_READWRITE */
+					/* 	NULL */
+					/* 	)) { */
+					/* 	trace("VirtualProtect failed: %d", GetLastError()); */
+
+					/* } */
+
+
+                    if (!ReadProcessMemory(
+                                           TargetProcessHandle,
+                                           (PVOID)(ThreadContext.Rip + 0x6CD54 - 0x5D234),
+                                           &iOriginal,
+                                           sizeof(iOriginal),
+                                           &dwBytesRead)) {
+
+						trace("ReadProcessMemory: %p %d\n", ThreadContext.Rip + 0x6CD54 - 0x5D234, GetLastError());
+                            return FALSE;
+                    }
+
+                    trace("Original: Current RIP: %p; %02x at %p\n", ThreadContext.Rip, iOriginal, ThreadContext.Rip + 0x6CD54 - 0x5D234);
+                    if (!WriteProcessMemory(
+                                            TargetProcessHandle,
+                                            (PVOID) (ThreadContext.Rip + 0x6CD54 - 0x5D234),
+                                            &iBrk,
+                                            sizeof(iBrk),
+                                            &dwBytesRead)) {
+
+                            trace("WriteProcessMemory: %d\n", GetLastError());
+                            return FALSE;
+                    }
+
+                    Sleep(20 * 1000);
+
+                    // ResumeThread by debugger
+                    return TRUE;
+
+
+#endif
+
+
 					ResumeThread(TargetThreadHandle);
 					Success = TRUE;
 				}
@@ -293,4 +424,3 @@ BOOL MapNewExecutableRegionInProcess(
 }
 
 #endif /* _WIN64 */
-
